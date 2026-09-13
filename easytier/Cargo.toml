@@ -210,6 +210,9 @@ kcp-sys = { git = "https://github.com/EasyTier/kcp-sys", rev = "d7427c22d764deb1
 hickory-resolver = { version = "0.25.2", optional = true }
 hickory-proto = { version = "0.25.2", optional = true }
 
+# for dns over https
+webpki-roots = { version = "0.26", optional = true }
+
 # for magic dns
 hickory-client = { version = "0.25.2", optional = true }
 hickory-server = { version = "0.25.2", features = [
@@ -290,6 +293,7 @@ thunk-rs = { git = "https://github.com/easytier/thunk.git", default-features = f
 
 [dev-dependencies]
 criterion = "0.5.1"
+h2 = "0.4"
 easytier-core = { path = "../easytier-core", version = "2.7.0", default-features = false, features = [
     "test-utils",
 ] }
@@ -334,6 +338,7 @@ default = [
     "extended-services",
     "linux-netlink",
     "tcp-hole-punch",
+    "doh",
 ]
 full = [
     "websocket",
@@ -354,6 +359,7 @@ full = [
     "endpoint-discovery",
     "extended-services",
     "tcp-hole-punch",
+    "doh",
 ]
 wireguard = ["vpn-portal", "dep:boringtun", "dep:hkdf", "dep:sha2", "ring-crypto", "easytier-proto/wireguard"]
 quic = ["wrapped-transport", "easytier-core/proxy-packet", "dep:quinn", "dep:quinn-proto", "dep:seahash", "dep:rustls", "easytier-proto/quic"]
@@ -390,6 +396,13 @@ tracing = ["tokio/tracing", "dep:console-subscriber", "dep:tracing-subscriber"]
 tracing-log = ["tracing/log", "easytier-core/tracing-log"]
 logging = []
 dns-resolver = ["dep:hickory-proto", "dep:hickory-resolver"]
+doh = [
+    "dns-resolver",
+    "hickory-resolver/https-ring",
+    "hickory-resolver/webpki-roots",
+    "dep:rustls",
+    "dep:webpki-roots",
+]
 magic-dns = [
     "dns-resolver",
     "dep:hickory-client",

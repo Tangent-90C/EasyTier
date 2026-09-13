@@ -233,6 +233,21 @@ core_clap:
   accept_dns:
     en: "if true, enable magic dns. with magic dns, you can access other nodes with a domain name, e.g.: <hostname>.et.net. magic dns will modify your system dns settings, enable it carefully."
     zh-CN: "如果为true，则启用魔法DNS。使用魔法DNS，您可以使用域名访问其他节点，例如：<hostname>.et.net。魔法DNS将修改您的系统DNS设置，请谨慎启用。"
+  doh_url:
+    en: "DNS-over-HTTPS endpoint used to resolve domain names in-process, e.g.: https://dns.google/dns-query or https://1.1.1.1/dns-query. an ip literal in the url pins the server address; for a domain host, provide doh_bootstrap_ip to avoid a plaintext bootstrap lookup."
+    zh-CN: "程序内解析域名使用的 DoH 端点，例如：https://dns.google/dns-query 或 https://1.1.1.1/dns-query。url 中直接写 IP 可固定服务器地址；若为域名，建议配合 doh_bootstrap_ip 以避免明文引导解析。"
+  doh_bootstrap_ip:
+    en: "pinned ip used to reach the DoH server when its url host is a domain. the tls certificate is still validated against the domain name."
+    zh-CN: "当 DoH url 的 host 为域名时，用于直连该服务器的固定 IP。TLS 证书仍按域名校验。"
+  doh_tls_name:
+    en: "override the tls server name (SNI and certificate validation) of the DoH server, useful for self-hosted servers whose certificate does not match the url host."
+    zh-CN: "覆盖 DoH 服务器的 TLS 服务器名（SNI 与证书校验），适用于自建服务器的证书与 url host 不一致的情况。"
+  doh_only:
+    en: "if true, never fall back to plaintext DNS: when the DoH server is unreachable, domain resolution fails. a bootstrap ip is required for domain DoH urls."
+    zh-CN: "如果为true，则绝不回退到明文 DNS：DoH 服务器不可达时域名解析直接失败。域名形式的 DoH url 必须提供引导 IP。"
+  doh_ca_cert:
+    en: "path to a PEM file with a CA chain to trust for the DoH server, for privately hosted DoH endpoints. defaults to the webpki public roots."
+    zh-CN: "信任 DoH 服务器的 CA 证书 PEM 文件路径，用于自建 DoH 服务。默认使用 webpki 公共根证书。"
   tld_dns_zone:
     en: "specify the top-level domain zone for magic DNS. if not provided, defaults to the value from dns_server module (et.net.). only used when accept_dns is true."
     zh-CN: "指定魔法DNS的顶级域名区域。如果未提供，默认使用dns_server模块中的值（et.net.）。仅在accept_dns为true时使用。"

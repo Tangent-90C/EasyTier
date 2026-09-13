@@ -618,6 +618,48 @@ struct NetworkOptions {
     )]
     accept_dns: Option<bool>,
 
+    #[cfg(feature = "doh")]
+    #[arg(
+        long,
+        env = "ET_DOH_URL",
+        help = t!("core_clap.doh_url").to_string(),
+    )]
+    doh_url: Option<String>,
+
+    #[cfg(feature = "doh")]
+    #[arg(
+        long,
+        env = "ET_DOH_BOOTSTRAP_IP",
+        help = t!("core_clap.doh_bootstrap_ip").to_string(),
+    )]
+    doh_bootstrap_ip: Option<std::net::IpAddr>,
+
+    #[cfg(feature = "doh")]
+    #[arg(
+        long,
+        env = "ET_DOH_TLS_NAME",
+        help = t!("core_clap.doh_tls_name").to_string(),
+    )]
+    doh_tls_name: Option<String>,
+
+    #[cfg(feature = "doh")]
+    #[arg(
+        long,
+        env = "ET_DOH_ONLY",
+        default_missing_value = "true",
+        num_args = 0..=1,
+        help = t!("core_clap.doh_only").to_string(),
+    )]
+    doh_only: Option<bool>,
+
+    #[cfg(feature = "doh")]
+    #[arg(
+        long,
+        env = "ET_DOH_CA_CERT",
+        help = t!("core_clap.doh_ca_cert").to_string(),
+    )]
+    doh_ca_cert: Option<String>,
+
     #[arg(
         long = "tld-dns-zone",
         env = "ET_TLD_DNS_ZONE",
@@ -1509,6 +1551,18 @@ fn win_service_main(arg: Vec<std::ffi::OsString>) {
 async fn run_main(cli: Cli) -> anyhow::Result<()> {
     defer!(dump_profile(0););
     log::init(&cli.logging_options, true)?;
+
+    #[cfg(feature = "doh")]
+    if let Some(doh_url) = cli.network_options.doh_url.as_deref() {
+        crate::common::dns::init_doh(crate::common::dns::DohSettings {
+            url: doh_url.to_owned(),
+            bootstrap_ip: cli.network_options.doh_bootstrap_ip,
+            tls_name: cli.network_options.doh_tls_name.clone(),
+            only: cli.network_options.doh_only.unwrap_or(false),
+            ca_cert_path: cli.network_options.doh_ca_cert.clone(),
+        })
+        .await?;
+    }
 
     let manager = Arc::new(native_cli_instance_manager().with_config_path(cli.config_dir.clone()));
 

@@ -51,26 +51,358 @@ pub fn get_default_resolver_config() -> ResolverConfig {
 }
 
 #[cfg(feature = "dns-resolver")]
-fn resolver_config() -> (ResolverConfig, ResolverOpts) {
-    let system_cfg = read_system_conf();
-    let mut config = get_default_resolver_config();
-    let mut options = ResolverOpts::default();
-    if let Ok(system) = system_cfg {
-        for name_server in system.0.name_servers() {
+fn append_legacy_name_servers(config: &mut ResolverConfig, system: Option<&ResolverConfig>) {
+    for name_server in get_default_resolver_config().name_servers() {
+        config.add_name_server(name_server.clone());
+    }
+    if let Some(system) = system {
+        for name_server in system.name_servers() {
             config.add_name_server(name_server.clone());
         }
-        options = system.1;
+    }
+}
+
+/// User-facing DNS-over-HTTPS settings.
+#[cfg(feature = "doh")]
+#[derive(Debug, Clone)]
+pub struct DohSettings {
+    /// DoH endpoint, e.g. `https://dns.google/dns-query` or `https://1.1.1.1/dns-query`.
+    pub url: String,
+    /// Pinned IP used to reach the DoH server. Required when the url host is a
+    /// domain and `only` is set; otherwise a single plaintext bootstrap lookup
+    /// resolves it.
+    pub bootstrap_ip: Option<IpAddr>,
+    /// Overrides the TLS server name used for SNI and certificate validation.
+    pub tls_name: Option<String>,
+    /// Forbids falling back to plaintext DNS.
+    pub only: bool,
+    /// PEM file with a CA chain to trust instead of the webpki roots, for
+    /// privately hosted DoH servers.
+    pub ca_cert_path: Option<String>,
+}
+
+/// A validated, bootstrap-resolved DoH name server.
+#[cfg(feature = "dns-resolver")]
+#[derive(Debug)]
+pub(crate) struct DohServerConfig {
+    pub(crate) name_server: NameServerConfig,
+    /// DER-encoded CA certificates to trust instead of the webpki roots.
+    pub(crate) ca_certs_der: Vec<Vec<u8>>,
+    pub(crate) only: bool,
+}
+
+#[cfg(feature = "doh")]
+static DOH_CONFIG: std::sync::Mutex<Option<Arc<DohServerConfig>>> = std::sync::Mutex::new(None);
+
+/// Installs the process-global DoH configuration. Must run before the first
+/// DNS lookup: the static resolver snapshots the configuration lazily and
+/// contextual resolvers snapshot it per request.
+#[cfg(feature = "doh")]
+pub async fn init_doh(settings: DohSettings) -> anyhow::Result<()> {
+    let config = resolve_doh_config(&settings).await?;
+    *DOH_CONFIG.lock().unwrap() = Some(Arc::new(config));
+    tracing::info!(
+        url = %settings.url,
+        only = settings.only,
+        "DoH resolver configured"
+    );
+    Ok(())
+}
+
+/// Resolves the DoH server domain with the system resolver when no bootstrap
+/// ip was given. This is a single plaintext lookup that only reveals the DoH
+/// server's own domain.
+/// The host part of a DoH endpoint url, normalized (IPv6 without brackets).
+#[cfg(feature = "doh")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DohUrlHost {
+    Ip(IpAddr),
+    Domain(String),
+}
+
+/// Parses and validates the DoH endpoint url into its host, port and
+/// http endpoint path. Uses `url::Host` so IPv6 literals work with or
+/// without the brackets `host_str()` would render.
+#[cfg(feature = "doh")]
+fn parse_doh_url(url: &str) -> anyhow::Result<(DohUrlHost, u16, String)> {
+    let parsed = url::Url::parse(url).with_context(|| format!("invalid DoH url: {url}"))?;
+    anyhow::ensure!(
+        parsed.scheme() == "https",
+        "DoH url must use the https scheme: {url}"
+    );
+    anyhow::ensure!(
+        parsed.query().is_none(),
+        "DoH url must not contain a query string: {url}"
+    );
+    let host = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => DohUrlHost::Ip(IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => DohUrlHost::Ip(IpAddr::V6(ip)),
+        Some(url::Host::Domain(domain)) => DohUrlHost::Domain(domain.to_string()),
+        None => anyhow::bail!("DoH url has no host: {url}"),
+    };
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let path = parsed.path();
+    let endpoint = if path.is_empty() || path == "/" {
+        "/dns-query".to_string()
+    } else {
+        path.to_string()
+    };
+    Ok((host, port, endpoint))
+}
+
+#[cfg(feature = "doh")]
+pub(crate) async fn resolve_doh_config(settings: &DohSettings) -> anyhow::Result<DohServerConfig> {
+    let (host, port, _) = parse_doh_url(&settings.url)?;
+
+    let mut bootstrap = settings.bootstrap_ip;
+    if let DohUrlHost::Domain(domain) = &host {
+        if bootstrap.is_none() {
+            if settings.only {
+                anyhow::bail!(
+                    "doh_only requires a bootstrap ip when the DoH url host is a domain ({domain})"
+                );
+            }
+            bootstrap = Some(resolve_doh_bootstrap(domain, port).await?);
+        }
+    }
+
+    let name_server = build_doh_name_server(&settings.url, bootstrap, settings.tls_name.as_deref())?;
+    let ca_certs_der = match &settings.ca_cert_path {
+        Some(path) => parse_pem_certs(path)?
+            .into_iter()
+            .map(|cert| cert.to_vec())
+            .collect(),
+        None => Vec::new(),
+    };
+    Ok(DohServerConfig {
+        name_server,
+        ca_certs_der,
+        only: settings.only,
+    })
+}
+
+#[cfg(feature = "doh")]
+async fn resolve_doh_bootstrap(host: &str, port: u16) -> anyhow::Result<IpAddr> {
+    tokio::net::lookup_host((host, port))
+        .await
+        .with_context(|| format!("failed to bootstrap resolve DoH server domain: {host}"))?
+        .next()
+        .with_context(|| format!("DoH server domain resolved to no addresses: {host}"))
+        .map(|addr| addr.ip())
+}
+
+/// Maps a DoH endpoint url onto hickory's name server config. The pinned
+/// `bootstrap_ip` (or the literal IP in the url) becomes the socket address,
+/// while the domain (or the explicit override) stays the TLS server name, so
+/// certificate validation is independent of how the server is reached.
+#[cfg(feature = "doh")]
+pub(crate) fn build_doh_name_server(
+    url: &str,
+    bootstrap_ip: Option<IpAddr>,
+    tls_name_override: Option<&str>,
+) -> anyhow::Result<NameServerConfig> {
+    let (host, port, endpoint) = parse_doh_url(url)?;
+
+    let ip = match &host {
+        DohUrlHost::Ip(ip) => *ip,
+        DohUrlHost::Domain(domain) => bootstrap_ip.with_context(|| {
+            format!("DoH url host is a domain ({domain}), a bootstrap ip is required")
+        })?,
+    };
+    // The tls name stays a plain address literal for IPv6 (no brackets) so
+    // rustls parses it as a ServerName::IpAddress.
+    let tls_name = tls_name_override
+        .map(ToString::to_string)
+        .unwrap_or(match &host {
+            DohUrlHost::Ip(ip) => ip.to_string(),
+            DohUrlHost::Domain(domain) => domain.clone(),
+        });
+
+    let mut name_server = NameServerConfig::new(SocketAddr::new(ip, port), Protocol::Https);
+    name_server.tls_dns_name = Some(tls_name);
+    name_server.http_endpoint = Some(endpoint);
+    Ok(name_server)
+}
+
+#[cfg(feature = "doh")]
+fn parse_pem_certs(path: &str) -> anyhow::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    use base64::Engine as _;
+
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read DoH CA cert file: {path}"))?;
+    let mut certs = Vec::new();
+    let mut current: Option<String> = None;
+    for line in content.lines() {
+        let line = line.trim();
+        if line == "-----BEGIN CERTIFICATE-----" {
+            current = Some(String::new());
+        } else if line == "-----END CERTIFICATE-----" {
+            let body = current.take().with_context(|| {
+                format!("malformed PEM in {path}: end marker without start marker")
+            })?;
+            let der = base64::engine::general_purpose::STANDARD
+                .decode(body)
+                .with_context(|| format!("malformed base64 in PEM file {path}"))?;
+            certs.push(rustls::pki_types::CertificateDer::from(der));
+        } else if let Some(body) = current.as_mut() {
+            if !line.is_empty() {
+                body.push_str(line);
+            }
+        }
+    }
+    anyhow::ensure!(!certs.is_empty(), "no PEM certificates found in {path}");
+    Ok(certs)
+}
+
+#[cfg(feature = "doh")]
+impl DohServerConfig {
+    fn tls_client_config(&self) -> rustls::ClientConfig {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let builder = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("rustls supports the default protocol versions");
+        let mut roots = rustls::RootCertStore::empty();
+        if self.ca_certs_der.is_empty() {
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        } else {
+            for cert in &self.ca_certs_der {
+                roots
+                    .add(rustls::pki_types::CertificateDer::from(cert.clone()))
+                    .expect("CA certificates are validated when the DoH config is built");
+            }
+        }
+        builder.with_root_certificates(roots).with_no_client_auth()
+    }
+}
+
+#[cfg(feature = "dns-resolver")]
+pub(crate) fn current_doh() -> Option<Arc<DohServerConfig>> {
+    #[cfg(feature = "doh")]
+    {
+        DOH_CONFIG.lock().unwrap().clone()
+    }
+    #[cfg(not(feature = "doh"))]
+    {
+        None
+    }
+}
+
+/// How long a DoH lookup may take before falling back (or failing, in
+/// `only` mode). Cold lookups pay one TCP + TLS + HTTP/2 handshake.
+#[cfg(all(feature = "dns-resolver", feature = "doh"))]
+const DOH_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Tries the DoH resolver first and falls back to the provided future only
+/// when plaintext DNS is allowed.
+#[cfg(feature = "dns-resolver")]
+async fn lookup_via_doh_first<FDoH, FFallback>(
+    doh: Option<&DohServerConfig>,
+    doh_lookup: FDoH,
+    fallback: FFallback,
+) -> anyhow::Result<Vec<IpAddr>>
+where
+    FDoH: Future<Output = anyhow::Result<Vec<IpAddr>>>,
+    FFallback: Future<Output = anyhow::Result<Vec<IpAddr>>>,
+{
+    #[cfg(feature = "doh")]
+    {
+        if let Some(doh) = doh {
+            return lookup_via_doh_first_with_timeout(doh, DOH_LOOKUP_TIMEOUT, doh_lookup, fallback)
+                .await;
+        }
+    }
+    #[cfg(not(feature = "doh"))]
+    {
+        let _ = doh;
+    }
+    doh_lookup.await
+}
+
+#[cfg(all(feature = "dns-resolver", feature = "doh"))]
+async fn lookup_via_doh_first_with_timeout<FDoH, FFallback>(
+    doh: &DohServerConfig,
+    timeout: Duration,
+    doh_lookup: FDoH,
+    fallback: FFallback,
+) -> anyhow::Result<Vec<IpAddr>>
+where
+    FDoH: Future<Output = anyhow::Result<Vec<IpAddr>>>,
+    FFallback: Future<Output = anyhow::Result<Vec<IpAddr>>>,
+{
+    match tokio::time::timeout(timeout, doh_lookup).await {
+        Ok(Ok(addrs)) => {
+            tracing::debug!(?addrs, "doh lookup done");
+            return Ok(addrs);
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(?error, "doh lookup failed");
+        }
+        Err(_) => {
+            tracing::warn!(?timeout, "doh lookup timed out");
+        }
+    }
+    if doh.only {
+        anyhow::bail!("DoH lookup failed and plaintext DNS is disabled (doh_only)");
+    }
+    fallback.await
+}
+
+#[cfg(feature = "dns-resolver")]
+fn resolver_config_with(doh: Option<&DohServerConfig>) -> (ResolverConfig, ResolverOpts) {
+    let mut options = ResolverOpts::default();
+    let mut system_config: Option<ResolverConfig> = None;
+    if let Ok((system_conf, system_opts)) = read_system_conf() {
+        system_config = Some(system_conf);
+        options = system_opts;
+    }
+
+    let mut config = ResolverConfig::new();
+    if let Some(doh) = doh {
+        config.add_name_server(doh.name_server.clone());
+        #[cfg(feature = "doh")]
+        {
+            options.tls_config = doh.tls_client_config();
+        }
+    }
+    let doh_only = doh.map(|doh| doh.only).unwrap_or(false);
+    if !doh_only {
+        append_legacy_name_servers(&mut config, system_config.as_ref());
     }
     options.ip_strategy = LookupIpStrategy::Ipv4AndIpv6;
     (config, options)
 }
 
 #[cfg(feature = "dns-resolver")]
+fn resolver_config() -> (ResolverConfig, ResolverOpts) {
+    #[cfg(feature = "doh")]
+    {
+        resolver_config_with(current_doh().as_deref())
+    }
+    #[cfg(not(feature = "doh"))]
+    {
+        resolver_config_with(None)
+    }
+}
+
+#[cfg(feature = "dns-resolver")]
+fn build_resolver(doh: Option<&DohServerConfig>) -> Resolver<GenericConnector<TokioRuntimeProvider>>
+{
+    let (config, options) = resolver_config_with(doh);
+    TokioResolver::builder_with_config(config, TokioConnectionProvider::default())
+        .with_options(options)
+        .build()
+}
+
+#[cfg(feature = "dns-resolver")]
 static RESOLVER: Lazy<Arc<Resolver<GenericConnector<TokioRuntimeProvider>>>> = Lazy::new(|| {
-    let (config, options) = resolver_config();
-    let builder = TokioResolver::builder_with_config(config, TokioConnectionProvider::default())
-        .with_options(options);
-    Arc::new(builder.build())
+    #[cfg(feature = "doh")]
+    {
+        Arc::new(build_resolver(current_doh().as_deref()))
+    }
+    #[cfg(not(feature = "doh"))]
+    {
+        Arc::new(build_resolver(None))
+    }
 });
 
 #[cfg(feature = "dns-resolver")]
@@ -291,6 +623,26 @@ impl RuntimeDnsResolver {
 
     #[cfg(feature = "dns-resolver")]
     async fn resolve_process_ips(&self, host: &str) -> anyhow::Result<Vec<IpAddr>> {
+        #[cfg(feature = "doh")]
+        if let Some(doh) = current_doh() {
+            let resolver_host = host.to_owned();
+            let doh_lookup = async {
+                let response = RESOLVER
+                    .lookup_ip(&resolver_host)
+                    .await
+                    .with_context(|| format!("DoH lookup_ip failed, host: {resolver_host}"))?;
+                Ok::<Vec<IpAddr>, anyhow::Error>(response.iter().collect())
+            };
+            let fallback_host = host.to_owned();
+            let fallback = async move {
+                lookup_host((fallback_host.as_str(), 0))
+                    .await
+                    .map(|addrs| addrs.map(|addr| addr.ip()).collect())
+                    .map_err(Into::into)
+            };
+            return lookup_via_doh_first(Some(&doh), doh_lookup, fallback).await;
+        }
+
         let system_host = host.to_owned();
         self.system_dns
             .resolve(
@@ -318,6 +670,24 @@ impl RuntimeDnsResolver {
         context: RuntimeDnsIoContext,
         host: String,
     ) -> anyhow::Result<Vec<IpAddr>> {
+        #[cfg(feature = "doh")]
+        if let Some(doh) = current_doh() {
+            let doh_lookup = Self::resolve_contextual_with_hickory(context.clone(), host.clone());
+            if doh.only {
+                return doh_lookup.await;
+            }
+            match tokio::time::timeout(DOH_LOOKUP_TIMEOUT, doh_lookup).await {
+                Ok(Ok(addresses)) => return Ok(addresses),
+                Ok(Err(error)) => {
+                    tracing::warn!(?error, "contextual doh lookup failed, fallback to system dns")
+                }
+                Err(_) => {
+                    tracing::warn!("contextual doh lookup timed out, fallback to system dns")
+                }
+            }
+            // fall through to the legacy system-first paths below
+        }
+
         if context.socket_mark.is_some() || native_socket_protection_available() {
             return Self::resolve_contextual_with_hickory(context, host).await;
         }
@@ -487,6 +857,35 @@ async fn socket_addrs_with_system_resolver(
     }
     let host = host.to_string();
 
+    // DNS-over-HTTPS path: plaintext lookups only run as an explicit
+    // fallback when doh_only is not set.
+    #[cfg(all(feature = "dns-resolver", feature = "doh"))]
+    if let Some(doh) = current_doh() {
+        let doh_host = host.clone();
+        let doh_lookup = async {
+            let response = RESOLVER.lookup_ip(&doh_host).await.with_context(|| {
+                format!("DoH lookup_ip failed, host: {doh_host}, port: {port}")
+            })?;
+            Ok::<Vec<IpAddr>, anyhow::Error>(response.iter().collect())
+        };
+        let fallback_host = host.clone();
+        let allow_system = allow_system_resolver;
+        let fallback = async move {
+            anyhow::ensure!(
+                allow_system,
+                "system resolver is disabled for this lookup"
+            );
+            lookup_host(format!("{}:{}", fallback_host, port))
+                .await
+                .map(|addrs| addrs.map(|addr| addr.ip()).collect())
+                .map_err(Into::into)
+        };
+        return lookup_via_doh_first(Some(&doh), doh_lookup, fallback)
+            .await
+            .map(|ips| ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect())
+            .map_err(Into::into);
+    }
+
     if allow_system_resolver {
         let socket_addr = format!("{}:{}", host, port);
         match lookup_host(socket_addr).await {
@@ -644,5 +1043,455 @@ mod tests {
                 vec![SocketAddr::from(([127, 0, 0, 1], expected_port))]
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "doh"))]
+mod doh_tests {
+    use super::*;
+    use futures_util::FutureExt as _;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn prefer_config(url: &str, bootstrap: Option<IpAddr>) -> DohServerConfig {
+        resolve_doh_config(&DohSettings {
+            url: url.to_owned(),
+            bootstrap_ip: bootstrap,
+            tls_name: None,
+            only: false,
+            ca_cert_path: None,
+        })
+        .now_or_never()
+        .unwrap()
+        .unwrap()
+    }
+
+    fn only_config(url: &str, bootstrap: Option<IpAddr>) -> DohServerConfig {
+        resolve_doh_config(&DohSettings {
+            url: url.to_owned(),
+            bootstrap_ip: bootstrap,
+            tls_name: None,
+            only: true,
+            ca_cert_path: None,
+        })
+        .now_or_never()
+        .unwrap()
+        .unwrap()
+    }
+
+    #[test]
+    fn parses_ip_host_doh_url() {
+        let name_server = build_doh_name_server("https://1.1.1.1/dns-query", None, None).unwrap();
+        assert_eq!(name_server.socket_addr, "1.1.1.1:443".parse().unwrap());
+        assert_eq!(name_server.protocol, Protocol::Https);
+        assert_eq!(name_server.tls_dns_name.as_deref(), Some("1.1.1.1"));
+        assert_eq!(name_server.http_endpoint.as_deref(), Some("/dns-query"));
+    }
+
+    #[test]
+    fn parses_domain_with_bootstrap_and_custom_port_path() {
+        let name_server = build_doh_name_server(
+            "https://dns.google:8443/custom-dns",
+            Some(ip("8.8.8.8")),
+            None,
+        )
+        .unwrap();
+        assert_eq!(name_server.socket_addr, "8.8.8.8:8443".parse().unwrap());
+        assert_eq!(name_server.protocol, Protocol::Https);
+        assert_eq!(name_server.tls_dns_name.as_deref(), Some("dns.google"));
+        assert_eq!(name_server.http_endpoint.as_deref(), Some("/custom-dns"));
+    }
+
+    #[test]
+    fn tls_name_override_wins_over_host() {
+        let name_server =
+            build_doh_name_server("https://1.1.1.1/dns-query", None, Some("cloudflare-dns.com"))
+                .unwrap();
+        assert_eq!(name_server.tls_dns_name.as_deref(), Some("cloudflare-dns.com"));
+        assert_eq!(name_server.socket_addr, "1.1.1.1:443".parse().unwrap());
+    }
+
+    #[test]
+    fn rejects_non_https_scheme() {
+        assert!(build_doh_name_server("http://1.1.1.1/dns-query", None, None).is_err());
+    }
+
+    #[test]
+    fn rejects_query_string_in_url() {
+        assert!(build_doh_name_server("https://1.1.1.1/dns-query?extra=1", None, None).is_err());
+    }
+
+    #[test]
+    fn domain_without_bootstrap_is_rejected() {
+        assert!(build_doh_name_server("https://dns.google/dns-query", None, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn only_mode_domain_requires_bootstrap() {
+        let error = resolve_doh_config(&DohSettings {
+            url: "https://dns.google/dns-query".to_owned(),
+            bootstrap_ip: None,
+            tls_name: None,
+            only: true,
+            ca_cert_path: None,
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("bootstrap"), "error: {error}");
+    }
+
+    #[tokio::test]
+    async fn ip_host_needs_no_bootstrap_even_in_only_mode() {
+        let config = only_config("https://1.1.1.1/dns-query", None);
+        assert_eq!(config.name_server.socket_addr, "1.1.1.1:443".parse().unwrap());
+        assert!(config.only);
+    }
+
+    #[test]
+    fn only_resolver_config_has_no_plaintext_name_servers() {
+        let config = only_config("https://1.1.1.1/dns-query", None);
+        let (resolver_config, _) = resolver_config_with(Some(&config));
+        let name_servers = resolver_config.name_servers();
+        assert_eq!(name_servers.len(), 1, "name_servers: {name_servers:?}");
+        assert_eq!(name_servers[0].protocol, Protocol::Https);
+    }
+
+    #[test]
+    fn prefer_resolver_config_keeps_plaintext_fallback_after_doh() {
+        let config = prefer_config("https://1.1.1.1/dns-query", None);
+        let (resolver_config, _) = resolver_config_with(Some(&config));
+        let name_servers = resolver_config.name_servers();
+        assert!(name_servers.len() >= 2, "name_servers: {name_servers:?}");
+        assert_eq!(name_servers[0].protocol, Protocol::Https);
+        assert!(name_servers[1..].iter().any(|ns| ns.protocol == Protocol::Udp));
+    }
+
+    #[test]
+    fn resolver_config_without_doh_matches_legacy_behavior() {
+        let (resolver_config, _) = resolver_config_with(None);
+        assert!(!resolver_config.name_servers().is_empty());
+        assert!(resolver_config
+            .name_servers()
+            .iter()
+            .all(|ns| ns.protocol != Protocol::Https));
+    }
+
+    #[tokio::test]
+    async fn doh_failure_falls_back_when_prefer() {
+        let config = prefer_config("https://1.1.1.1/dns-query", None);
+        let result = lookup_via_doh_first_with_timeout(
+            &config,
+            Duration::from_millis(50),
+            async { anyhow::bail!("DoH server unreachable") },
+            async { Ok(vec![ip("127.0.0.1")]) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, vec![ip("127.0.0.1")]);
+    }
+
+    #[tokio::test]
+    async fn doh_failure_bails_when_only() {
+        let config = only_config("https://1.1.1.1/dns-query", None);
+        let result = lookup_via_doh_first_with_timeout(
+            &config,
+            Duration::from_millis(50),
+            async { anyhow::bail!("DoH server unreachable") },
+            async { Ok(vec![ip("127.0.0.1")]) },
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn doh_success_skips_plaintext_fallback() {
+        let config = prefer_config("https://1.1.1.1/dns-query", None);
+        let result = lookup_via_doh_first_with_timeout(
+            &config,
+            Duration::from_millis(50),
+            async { Ok(vec![ip("192.0.2.1")]) },
+            async { anyhow::bail!("plaintext fallback must not be called") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, vec![ip("192.0.2.1")]);
+    }
+
+    #[tokio::test]
+    async fn doh_timeout_falls_back_when_prefer() {
+        let config = prefer_config("https://1.1.1.1/dns-query", None);
+        let result = lookup_via_doh_first_with_timeout(
+            &config,
+            Duration::from_millis(10),
+            std::future::pending(),
+            async { Ok(vec![ip("127.0.0.2")]) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, vec![ip("127.0.0.2")]);
+    }
+
+    #[tokio::test]
+    async fn doh_timeout_bails_when_only() {
+        let config = only_config("https://1.1.1.1/dns-query", None);
+        let result = lookup_via_doh_first_with_timeout(
+            &config,
+            Duration::from_millis(10),
+            std::future::pending(),
+            async { Ok(vec![ip("127.0.0.2")]) },
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn parses_pem_ca_chain() {
+        let pem = generate_test_cert_pem();
+        let ca_file = tempfile::Builder::new().suffix(".pem").tempfile().unwrap();
+        std::fs::write(ca_file.path(), &pem).unwrap();
+        let certs = parse_pem_certs(ca_file.path().to_str().unwrap()).unwrap();
+        assert_eq!(certs.len(), 1);
+
+        std::fs::write(ca_file.path(), "not a pem").unwrap();
+        assert!(parse_pem_certs(ca_file.path().to_str().unwrap()).is_err());
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn tls_config_accepts_custom_ca_and_webpki_default() {
+        let mut config = prefer_config("https://1.1.1.1/dns-query", None);
+        config.ca_certs_der = parse_pem_to_der(generate_test_cert_pem());
+        let _tls_with_ca = config.tls_client_config();
+
+        config.ca_certs_der.clear();
+        let _tls_with_webpki = config.tls_client_config();
+    }
+
+    #[cfg(feature = "websocket")]
+    fn generate_test_cert_pem() -> String {
+        let params = rcgen::CertificateParams::new(vec!["localhost".to_owned()]);
+        rcgen::Certificate::from_params(params)
+            .unwrap()
+            .serialize_pem()
+            .unwrap()
+    }
+
+    fn parse_pem_to_der(pem: String) -> Vec<Vec<u8>> {
+        let ca_file = tempfile::Builder::new().suffix(".pem").tempfile().unwrap();
+        std::fs::write(ca_file.path(), pem).unwrap();
+        parse_pem_certs(ca_file.path().to_str().unwrap())
+            .unwrap()
+            .into_iter()
+            .map(|cert| cert.to_vec())
+            .collect()
+    }
+    #[test]
+    fn parses_ipv6_literal_doh_url() {
+        let name_server =
+            build_doh_name_server("https://[2606:4700:4700::1111]/dns-query", None, None).unwrap();
+        assert_eq!(
+            name_server.socket_addr,
+            "[2606:4700:4700::1111]:443".parse().unwrap()
+        );
+        assert_eq!(name_server.protocol, Protocol::Https);
+        // no brackets in the tls name so rustls parses it as an IP server name
+        assert_eq!(
+            name_server.tls_dns_name.as_deref(),
+            Some("2606:4700:4700::1111")
+        );
+        assert_eq!(name_server.http_endpoint.as_deref(), Some("/dns-query"));
+    }
+
+    #[tokio::test]
+    async fn ipv6_literal_needs_no_bootstrap_even_in_only_mode() {
+        let config = only_config("https://[2606:4700:4700::1111]/dns-query", None);
+        assert_eq!(
+            config.name_server.socket_addr,
+            "[2606:4700:4700::1111]:443".parse().unwrap()
+        );
+        assert!(config.only);
+    }
+
+    #[test]
+    fn domain_with_ipv6_bootstrap_resolves_to_v6_socket() {
+        let name_server = build_doh_name_server(
+            "https://dns.google/dns-query",
+            Some(ip("2001:4860:4860::8888")),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            name_server.socket_addr,
+            "[2001:4860:4860::8888]:443".parse().unwrap()
+        );
+        assert_eq!(name_server.tls_dns_name.as_deref(), Some("dns.google"));
+    }
+}
+
+#[cfg(all(test, feature = "doh", feature = "websocket"))]
+mod doh_e2e_tests {
+    use super::*;
+
+    /// Runs a real TLS + HTTP/2 DoH server on a loopback port, answering
+    /// every A query with 192.0.2.1. Returns the port and the CA PEM temp
+    /// file the client must trust.
+    async fn spawn_local_doh_server() -> (u16, tempfile::TempPath) {
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_owned()]);
+        params
+            .subject_alt_names
+            .push(rcgen::SanType::IpAddress("127.0.0.1".parse().unwrap()));
+        let cert = rcgen::Certificate::from_params(params).unwrap();
+        let cert_pem = cert.serialize_pem().unwrap();
+        let cert_der = cert.serialize_der().unwrap();
+        let key_der = cert.get_key_pair().serialize_der();
+
+        let mut ca_file = tempfile::Builder::new().suffix(".pem").tempfile().unwrap();
+        std::io::Write::write_all(&mut ca_file, cert_pem.as_bytes()).unwrap();
+        let ca_path = ca_file.into_temp_path();
+
+        let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![rustls::pki_types::CertificateDer::from(cert_der)],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key_der).into(),
+        )
+        .unwrap();
+        let mut server_config = server_config;
+        server_config.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    if let Ok(tls) = acceptor.accept(tcp).await {
+                        serve_doh_over_h2(tls).await;
+                    }
+                });
+            }
+        });
+
+        (port, ca_path)
+    }
+
+    async fn serve_doh_over_h2<S>(tls: S)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    {
+        let mut conn = match h2::server::handshake(tls).await {
+            Ok(conn) => conn,
+            Err(_) => return,
+        };
+        while let Some(accepted) = conn.accept().await {
+            let (request, mut respond) = match accepted {
+                Ok(accepted) => accepted,
+                Err(_) => return,
+            };
+            let (_, mut body) = request.into_parts();
+            let mut query = Vec::new();
+            while let Some(chunk) = body.data().await {
+                match chunk {
+                    Ok(chunk) => {
+                        let _ = body.flow_control().release_capacity(chunk.len());
+                        query.extend_from_slice(&chunk);
+                    }
+                    Err(_) => break,
+                }
+            }
+            let response_bytes = build_doh_response(&query);
+            let http_response = http::Response::builder()
+                .status(200)
+                .header("content-type", "application/dns-message")
+                .body(())
+                .unwrap();
+            if let Ok(mut send) = respond.send_response(http_response, false) {
+                let _ = send.send_data(response_bytes.into(), true);
+            }
+        }
+    }
+
+    fn build_doh_response(query: &[u8]) -> Vec<u8> {
+        use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
+        use hickory_proto::rr::rdata::A;
+        use hickory_proto::rr::{RData, Record, RecordType};
+
+        let request = Message::from_vec(query).expect("valid dns query");
+        let q = request.queries().first().expect("query present").clone();
+        let mut response = Message::new();
+        response.set_id(request.id());
+        response.set_message_type(MessageType::Response);
+        response.set_op_code(OpCode::Query);
+        response.set_response_code(ResponseCode::NoError);
+        // hickory only trusts empty/negative answers from authoritative servers
+        response.set_authoritative(true);
+        response.add_query(q.clone());
+        if q.query_type() == RecordType::A {
+            response.add_answer(Record::from_rdata(
+                q.name().clone(),
+                60,
+                RData::A(A::from(std::net::Ipv4Addr::new(192, 0, 2, 1))),
+            ));
+        }
+        response.to_vec().expect("serialize dns response")
+    }
+
+    #[tokio::test]
+    async fn resolves_through_local_tls_h2_doh_server() {
+        let (port, ca_path) = spawn_local_doh_server().await;
+
+        let settings = DohSettings {
+            url: format!("https://127.0.0.1:{port}/dns-query"),
+            bootstrap_ip: None,
+            tls_name: None,
+            // only=true so the test cannot silently leak to plaintext servers
+            only: true,
+            ca_cert_path: Some(ca_path.to_string_lossy().to_string()),
+        };
+        let config = resolve_doh_config(&settings).await.unwrap();
+        let resolver = build_resolver(Some(&config));
+        let ips: Vec<IpAddr> = resolver
+            .lookup_ip("doh-test.example.com")
+            .await
+            .expect("DoH lookup over local TLS+H2 server")
+            .iter()
+            .collect();
+        assert!(
+            ips.contains(&"192.0.2.1".parse::<IpAddr>().unwrap()),
+            "ips: {ips:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_mode_never_falls_back_to_plaintext() {
+        // closed loopback port: the DoH connection is refused instantly
+        let settings = DohSettings {
+            url: "https://127.0.0.1:1/dns-query".to_owned(),
+            bootstrap_ip: None,
+            tls_name: None,
+            only: true,
+            ca_cert_path: None,
+        };
+        let config = resolve_doh_config(&settings).await.unwrap();
+        let resolver = build_resolver(Some(&config));
+        let result = lookup_via_doh_first(
+            Some(&config),
+            async {
+                let response = resolver.lookup_ip("doh-test.example.com").await?;
+                Ok::<_, anyhow::Error>(response.iter().collect::<Vec<IpAddr>>())
+            },
+            async { panic!("plaintext fallback must not run in only mode") },
+        )
+        .await;
+        assert!(result.is_err(), "only mode must fail when DoH is down");
     }
 }
