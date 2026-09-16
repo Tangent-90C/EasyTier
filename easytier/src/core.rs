@@ -541,6 +541,22 @@ struct NetworkOptions {
     )]
     socks5: Option<u16>,
 
+    #[cfg(feature = "socks5")]
+    #[arg(
+        long,
+        env = "ET_SOCKS5_USERNAME",
+        help = t!("core_clap.socks5_username").to_string()
+    )]
+    socks5_username: Option<String>,
+
+    #[cfg(feature = "socks5")]
+    #[arg(
+        long,
+        env = "ET_SOCKS5_PASSWORD",
+        help = t!("core_clap.socks5_password").to_string()
+    )]
+    socks5_password: Option<String>,
+
     #[arg(
         long,
         env = "ET_COMPRESSION",
@@ -1149,11 +1165,25 @@ impl NetworkOptions {
 
         #[cfg(feature = "socks5")]
         if let Some(socks5_proxy) = self.socks5 {
-            cfg.set_socks5_portal(Some(
-                format!("socks5://0.0.0.0:{}", socks5_proxy)
-                    .parse()
-                    .unwrap(),
-            ));
+            let mut portal: url::Url = format!("socks5://0.0.0.0:{}", socks5_proxy)
+                .parse()
+                .unwrap();
+            if self.socks5_username.is_some() || self.socks5_password.is_some() {
+                let username = self.socks5_username.clone().unwrap_or_default();
+                let password = self.socks5_password.clone().unwrap_or_default();
+                if username.is_empty() {
+                    anyhow::bail!(
+                        "--socks5-username must not be empty when SOCKS5 authentication is enabled"
+                    );
+                }
+                portal.set_username(&username).map_err(|_| {
+                    anyhow::anyhow!("failed to set SOCKS5 username")
+                })?;
+                portal.set_password(Some(&password)).map_err(|_| {
+                    anyhow::anyhow!("failed to set SOCKS5 password")
+                })?;
+            }
+            cfg.set_socks5_portal(Some(portal));
         }
 
         for port_forward in self.port_forward.iter() {

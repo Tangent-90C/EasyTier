@@ -30,8 +30,8 @@ use crate::{
 };
 
 use super::{
-    AcceptAuthentication, AsyncTcpConnector, Config, HostSocks5ServerRuntime, Result, Socks5Socket,
-    SocksError, codec::ReplyError,
+    AcceptAuthentication, AsyncTcpConnector, Authentication, Config, HostSocks5ServerRuntime,
+    Result, Socks5Socket, SocksError, StaticCredentialsAuthentication, codec::ReplyError,
 };
 
 struct Socks5DataPlaneConnector<H>
@@ -83,20 +83,26 @@ fn map_data_plane_error(error: DataPlaneError) -> SocksError {
     }
 }
 
-async fn handle_socks5_stream<H, S>(
+/// Which clients the SOCKS5 gateway accepts.
+#[derive(Clone)]
+pub(crate) enum Socks5ServerAuthentication {
+    /// Accepts every client without authentication.
+    AcceptAny,
+    /// Requires RFC 1929 username/password authentication.
+    StaticCredentials { username: String, password: String },
+}
+
+async fn handle_socks5_stream<H, S, A>(
     stream: S,
     data_plane: Arc<DataPlaneRuntime<H>>,
     source_addr: SocketAddr,
     command_runtime: Arc<HostSocks5ServerRuntime<H>>,
+    config: Config<A>,
 ) where
     H: VirtualTcpSocketFactory + VirtualTcpListenerFactory + VirtualUdpSocketFactory,
     S: VirtualTcpSocket,
+    A: Authentication + 'static,
 {
-    let mut config = Config::<AcceptAuthentication>::default();
-    config.set_request_timeout(10);
-    config.set_skip_auth(false);
-    config.set_allow_no_auth(true);
-
     let connector = Socks5DataPlaneConnector {
         data_plane,
         source_addr,
@@ -147,8 +153,17 @@ where
     }
 
     async fn start_inner(&self) -> anyhow::Result<()> {
-        let Some(bind_addr) = self.runtime_config.snapshot().services.gateway.socks5_bind else {
+        let snapshot = self.runtime_config.snapshot();
+        let gateway = &snapshot.services.gateway;
+        let Some(bind_addr) = gateway.socks5_bind else {
             return Ok(());
+        };
+        let authentication = match &gateway.socks5_credentials {
+            Some(credentials) => Socks5ServerAuthentication::StaticCredentials {
+                username: credentials.username.clone(),
+                password: credentials.password.clone(),
+            },
+            None => Socks5ServerAuthentication::AcceptAny,
         };
         let options = TcpListenOptions::socks5(bind_addr);
         let bind = options
@@ -170,12 +185,38 @@ where
                 match listener.accept().await {
                     Ok((socket, source_addr)) => {
                         tracing::info!(?source_addr, "accepted a SOCKS5 connection");
-                        session_tasks.lock().unwrap().spawn(handle_socks5_stream(
-                            socket,
-                            data_plane.clone(),
-                            source_addr,
-                            command_runtime.clone(),
-                        ));
+                        let data_plane = data_plane.clone();
+                        let command_runtime = command_runtime.clone();
+                        let authentication = authentication.clone();
+                        session_tasks.lock().unwrap().spawn(async move {
+                            match authentication {
+                                Socks5ServerAuthentication::AcceptAny => {
+                                    handle_socks5_stream(
+                                        socket,
+                                        data_plane,
+                                        source_addr,
+                                        command_runtime,
+                                        AcceptAuthentication::gateway_config(),
+                                    )
+                                    .await;
+                                }
+                                Socks5ServerAuthentication::StaticCredentials {
+                                    username,
+                                    password,
+                                } => {
+                                    handle_socks5_stream(
+                                        socket,
+                                        data_plane,
+                                        source_addr,
+                                        command_runtime,
+                                        StaticCredentialsAuthentication::gateway_config(
+                                            username, password,
+                                        ),
+                                    )
+                                    .await;
+                                }
+                            }
+                        });
                     }
                     Err(error) => tracing::error!(?error, "SOCKS5 accept failed"),
                 }

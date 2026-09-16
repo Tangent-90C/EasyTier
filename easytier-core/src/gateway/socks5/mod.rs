@@ -10,4 +10,7 @@ mod server;
 pub(crate) use adapter::Socks5GatewayAdapter;
 pub(crate) use codec::{Result, SocksError};
 pub(crate) use host::HostSocks5ServerRuntime;
-pub(crate) use server::{AcceptAuthentication, AsyncTcpConnector, Config, Socks5Socket};
+pub(crate) use server::{
+    AcceptAuthentication, AsyncTcpConnector, Authentication, Config, Socks5Socket,
+    StaticCredentialsAuthentication,
+};

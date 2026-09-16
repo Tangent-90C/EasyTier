@@ -81,6 +81,63 @@ impl Authentication for AcceptAuthentication {
     }
 }
 
+impl AcceptAuthentication {
+    /// Gateway defaults which accept every client without authentication.
+    pub(crate) fn gateway_config() -> Config<Self> {
+        let mut config = Config::default();
+        config.set_request_timeout(10);
+        config.set_skip_auth(false);
+        config.set_allow_no_auth(true);
+        config
+    }
+}
+
+/// Accepts a single fixed username/password pair (RFC 1929) and rejects
+/// every other client, including anonymous ones.
+#[derive(Clone)]
+pub(crate) struct StaticCredentialsAuthentication {
+    username: String,
+    password: String,
+}
+
+impl StaticCredentialsAuthentication {
+    pub(crate) fn new(username: String, password: String) -> Self {
+        Self { username, password }
+    }
+
+    /// Gateway defaults which require username/password authentication.
+    ///
+    /// Field setters run before [`Config::with_authentication`] because
+    /// `set_skip_auth` unconditionally clears the configured auth handler.
+    pub(crate) fn gateway_config(username: String, password: String) -> Config<Self> {
+        let mut config: Config<Self> = Config::default();
+        config.set_request_timeout(10);
+        config.set_allow_no_auth(false);
+        config.with_authentication(Self::new(username, password))
+    }
+}
+
+#[async_trait::async_trait]
+impl Authentication for StaticCredentialsAuthentication {
+    type Item = ();
+
+    async fn authenticate(&self, credentials: Option<(String, String)>) -> Option<Self::Item> {
+        let (username, password) = credentials?;
+        (constant_time_eq(username.as_bytes(), self.username.as_bytes())
+            && constant_time_eq(password.as_bytes(), self.password.as_bytes()))
+        .then_some(())
+    }
+}
+
+/// Compares byte slices in time independent of the position of the first
+/// mismatching byte. The length of the inputs is still observable.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
+}
+
 impl<A: Authentication> Config<A> {
     /// How much time it should wait until the request timeout.
     pub fn set_request_timeout(&mut self, n: u64) -> &mut Self {
@@ -101,6 +158,22 @@ impl<A: Authentication> Config<A> {
     pub fn set_allow_no_auth(&mut self, value: bool) -> &mut Self {
         self.allow_no_auth = value;
         self
+    }
+
+    /// Replaces the authentication handler of this config.
+    pub(crate) fn with_authentication<T: Authentication + 'static>(
+        self,
+        authentication: T,
+    ) -> Config<T> {
+        Config {
+            request_timeout: self.request_timeout,
+            skip_auth: self.skip_auth,
+            dns_resolve: self.dns_resolve,
+            execute_command: self.execute_command,
+            allow_udp: self.allow_udp,
+            allow_no_auth: self.allow_no_auth,
+            auth: Some(Arc::new(authentication)),
+        }
     }
 }
 
@@ -703,38 +776,6 @@ mod tests {
 
     use super::*;
 
-    struct SimpleUserPassword {
-        username: String,
-        password: String,
-    }
-
-    #[async_trait::async_trait]
-    impl Authentication for SimpleUserPassword {
-        type Item = ();
-
-        async fn authenticate(&self, credentials: Option<(String, String)>) -> Option<Self::Item> {
-            credentials
-                .filter(|(username, password)| {
-                    username == &self.username && password == &self.password
-                })
-                .map(|_| ())
-        }
-    }
-
-    impl<A: Authentication> Config<A> {
-        fn with_authentication<T: Authentication + 'static>(self, authentication: T) -> Config<T> {
-            Config {
-                request_timeout: self.request_timeout,
-                skip_auth: self.skip_auth,
-                dns_resolve: self.dns_resolve,
-                execute_command: self.execute_command,
-                allow_udp: self.allow_udp,
-                allow_no_auth: self.allow_no_auth,
-                auth: Some(Arc::new(authentication)),
-            }
-        }
-    }
-
     struct TestConnector {
         outbound: Mutex<Option<DuplexStream>>,
     }
@@ -838,11 +879,9 @@ mod tests {
     async fn password_authentication_rejection_preserves_wire_reply() {
         let (server_stream, mut client_stream) = tokio::io::duplex(128);
         let (outbound, _destination_stream) = tokio::io::duplex(128);
-        let config =
-            Config::<DenyAuthentication>::default().with_authentication(SimpleUserPassword {
-                username: "user".to_string(),
-                password: "correct".to_string(),
-            });
+        let config = Config::<StaticCredentialsAuthentication>::default().with_authentication(
+            StaticCredentialsAuthentication::new("user".to_string(), "correct".to_string()),
+        );
         let socket = Socks5Socket::new(
             server_stream,
             Arc::new(config),
@@ -872,5 +911,94 @@ mod tests {
             .err()
             .expect("wrong password must reject authentication");
         assert!(matches!(err, SocksError::AuthenticationRejected(_)));
+    }
+
+    #[tokio::test]
+    async fn password_authentication_accepts_matching_credentials() {
+        let (server_stream, mut client_stream) = tokio::io::duplex(1024);
+        let (outbound, mut destination_stream) = tokio::io::duplex(1024);
+        let config = Config::<StaticCredentialsAuthentication>::default().with_authentication(
+            StaticCredentialsAuthentication::new("user".to_string(), "correct".to_string()),
+        );
+        let socket = Socks5Socket::new(
+            server_stream,
+            Arc::new(config),
+            connector(outbound),
+            Arc::new(TestRuntime),
+        );
+        let task = tokio::spawn(socket.upgrade_to_socks5());
+
+        client_stream.write_all(&[5, 1, 2]).await.unwrap();
+        let mut method_reply = [0u8; 2];
+        client_stream.read_exact(&mut method_reply).await.unwrap();
+        assert_eq!(method_reply, [5, 2]);
+
+        // RFC 1929 subnegotiation: version 1, uname "user", passwd "correct"
+        client_stream
+            .write_all(&[
+                1, 4, b'u', b's', b'e', b'r', 7, b'c', b'o', b'r', b'r', b'e', b'c', b't',
+            ])
+            .await
+            .unwrap();
+        let mut auth_reply = [0u8; 2];
+        client_stream.read_exact(&mut auth_reply).await.unwrap();
+        assert_eq!(auth_reply, [1, 0]);
+
+        client_stream
+            .write_all(&[5, 1, 0, 1, 10, 42, 0, 7, 0, 80])
+            .await
+            .unwrap();
+        let mut connect_reply = [0u8; 10];
+        client_stream.read_exact(&mut connect_reply).await.unwrap();
+        assert_eq!(connect_reply[0..2], [5, 0]);
+
+        client_stream.write_all(b"hello").await.unwrap();
+        let mut request = [0u8; 5];
+        destination_stream.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"hello");
+
+        drop(client_stream);
+        drop(destination_stream);
+        assert!(task.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn credentials_required_rejects_clients_without_password_method() {
+        let (server_stream, mut client_stream) = tokio::io::duplex(128);
+        let (outbound, _destination_stream) = tokio::io::duplex(128);
+        let config = StaticCredentialsAuthentication::gateway_config(
+            "user".to_string(),
+            "correct".to_string(),
+        );
+        assert!(config.auth.is_some(), "auth must be configured");
+        assert!(!config.allow_no_auth, "anonymous must be disabled");
+        let socket = Socks5Socket::new(
+            server_stream,
+            Arc::new(config),
+            connector(outbound),
+            Arc::new(TestRuntime),
+        );
+        let task = tokio::spawn(socket.upgrade_to_socks5());
+
+        // the client only offers the "no authentication" method
+        client_stream.write_all(&[5, 1, 0]).await.unwrap();
+        let mut method_reply = [0u8; 2];
+        client_stream.read_exact(&mut method_reply).await.unwrap();
+        assert_eq!(method_reply, [5, 0xff]);
+
+        let error = task
+            .await
+            .unwrap()
+            .err()
+            .expect("anonymous client must be rejected");
+        assert!(matches!(error, SocksError::AuthMethodUnacceptable(_)));
+    }
+
+    #[test]
+    fn constant_time_eq_compares_only_equal_slices() {
+        assert!(constant_time_eq(b"same", b"same"));
+        assert!(!constant_time_eq(b"same", b"samE"));
+        assert!(!constant_time_eq(b"same", b"sam"));
+        assert!(constant_time_eq(b"", b""));
     }
 }

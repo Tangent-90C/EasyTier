@@ -4,10 +4,18 @@ use serde::{Deserialize, Serialize};
 
 use easytier_proto::common::{PortForwardConfigPb, SocketType};
 
+/// Static username/password credentials of the SOCKS5 gateway (RFC 1929).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Socks5Credentials {
+    pub username: String,
+    pub password: String,
+}
+
 /// Runtime configuration for the core-owned SOCKS and port-forward gateway.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GatewayRuntimeConfig {
     pub socks5_bind: Option<SocketAddr>,
+    pub socks5_credentials: Option<Socks5Credentials>,
     pub port_forwards: Vec<PortForwardConfig>,
 }
 

@@ -2,10 +2,12 @@
 
 use std::collections::BTreeSet;
 
+use percent_encoding::percent_decode_str;
+
 use crate::{
     config::{
         EncryptionAlgorithm, IpPrefix, NodeConfig, ProxyNetworkConfig, RouteConfig,
-        gateway::{GatewayRuntimeConfig, ProxyRuntimeConfig},
+        gateway::{GatewayRuntimeConfig, ProxyRuntimeConfig, Socks5Credentials},
         peers::{AclRuleConfig, HostRoutingPolicy, PublicIpv6ProviderConfig},
         runtime::CoreRuntimeConfig,
         toml::{ConfigLoader as _, Flags, TomlConfig},
@@ -273,9 +275,11 @@ impl CoreInstanceConfig {
             flags.enable_ipv6,
             socket_context.clone(),
         ));
-        let socks5_bind = (!host.ignore_unsupported_config || host.gateway_enabled)
+        let socks5_portal = (!host.ignore_unsupported_config || host.gateway_enabled)
             .then(|| config.get_socks5_portal())
-            .flatten()
+            .flatten();
+        let socks5_bind = socks5_portal
+            .as_ref()
             .map(|url| {
                 let host = url
                     .host_str()
@@ -288,6 +292,11 @@ impl CoreInstanceConfig {
                     .map_err(|error| anyhow::anyhow!("invalid SOCKS5 portal address: {error}"))
             })
             .transpose()?;
+        let socks5_credentials = socks5_portal
+            .as_ref()
+            .map(extract_socks5_credentials)
+            .transpose()?
+            .flatten();
         let runtime = CoreRuntimeConfig {
             acl: AclRuleConfig {
                 acl,
@@ -298,6 +307,7 @@ impl CoreInstanceConfig {
             dhcp_ipv4: config.get_dhcp(),
             gateway: GatewayRuntimeConfig {
                 socks5_bind,
+                socks5_credentials,
                 port_forwards: if host.ignore_unsupported_config && !host.gateway_enabled {
                     Vec::new()
                 } else {
@@ -400,8 +410,47 @@ impl CoreInstanceConfig {
     }
 }
 
+/// Extracts static SOCKS5 credentials from the portal url userinfo
+/// (`socks5://user:pass@host:port`). Returns `None` when the url carries no
+/// userinfo, which keeps the gateway open to anonymous clients.
+fn extract_socks5_credentials(url: &url::Url) -> anyhow::Result<Option<Socks5Credentials>> {
+    let username = url.username();
+    let password = url.password().unwrap_or_default();
+    if username.is_empty() && password.is_empty() {
+        return Ok(None);
+    }
+    let username = percent_decode_str(username).decode_utf8()?.into_owned();
+    let password = percent_decode_str(password).decode_utf8()?.into_owned();
+    if username.is_empty() {
+        anyhow::bail!("SOCKS5 portal username must not be empty when credentials are set");
+    }
+    Ok(Some(Socks5Credentials { username, password }))
+}
+
 #[cfg(test)]
 mod tests {
+    use super::extract_socks5_credentials;
+
+    #[test]
+    fn socks5_portal_credentials_come_from_url_userinfo() {
+        let url: url::Url = "socks5://0.0.0.0:1080".parse().unwrap();
+        assert!(extract_socks5_credentials(&url).unwrap().is_none());
+
+        let url: url::Url = "socks5://alice:s3cret@0.0.0.0:1080".parse().unwrap();
+        let credentials = extract_socks5_credentials(&url).unwrap().unwrap();
+        assert_eq!(credentials.username, "alice");
+        assert_eq!(credentials.password, "s3cret");
+
+        // userinfo arrives percent-encoded from the url crate
+        let url: url::Url = "socks5://%75ser:p%40ss@0.0.0.0:1080".parse().unwrap();
+        let credentials = extract_socks5_credentials(&url).unwrap().unwrap();
+        assert_eq!(credentials.username, "user");
+        assert_eq!(credentials.password, "p@ss");
+
+        let url: url::Url = "socks5://:password-only@0.0.0.0:1080".parse().unwrap();
+        assert!(extract_socks5_credentials(&url).is_err());
+    }
+
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
     use super::*;
