@@ -1049,7 +1049,7 @@ mod tests {
 #[cfg(all(test, feature = "doh"))]
 mod doh_tests {
     use super::*;
-    use futures_util::FutureExt as _;
+    use futures::FutureExt as _;
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
@@ -1272,11 +1272,9 @@ mod doh_tests {
 
     #[cfg(feature = "websocket")]
     fn generate_test_cert_pem() -> String {
-        let params = rcgen::CertificateParams::new(vec!["localhost".to_owned()]);
-        rcgen::Certificate::from_params(params)
-            .unwrap()
-            .serialize_pem()
-            .unwrap()
+        let params = rcgen::CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        params.self_signed(&key_pair).unwrap().pem()
     }
 
     fn parse_pem_to_der(pem: String) -> Vec<Vec<u8>> {
@@ -1339,17 +1337,15 @@ mod doh_e2e_tests {
     /// every A query with 192.0.2.1. Returns the port and the CA PEM temp
     /// file the client must trust.
     async fn spawn_local_doh_server() -> (u16, tempfile::TempPath) {
-        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_owned()]);
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
         params
             .subject_alt_names
             .push(rcgen::SanType::IpAddress("127.0.0.1".parse().unwrap()));
-        let cert = rcgen::Certificate::from_params(params).unwrap();
-        let cert_pem = cert.serialize_pem().unwrap();
-        let cert_der = cert.serialize_der().unwrap();
-        let key_der = cert.get_key_pair().serialize_der();
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
 
         let mut ca_file = tempfile::Builder::new().suffix(".pem").tempfile().unwrap();
-        std::io::Write::write_all(&mut ca_file, cert_pem.as_bytes()).unwrap();
+        std::io::Write::write_all(&mut ca_file, cert.pem().as_bytes()).unwrap();
         let ca_path = ca_file.into_temp_path();
 
         let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -1359,8 +1355,8 @@ mod doh_e2e_tests {
         .unwrap()
         .with_no_client_auth()
         .with_single_cert(
-            vec![rustls::pki_types::CertificateDer::from(cert_der)],
-            rustls::pki_types::PrivatePkcs8KeyDer::from(key_der).into(),
+            vec![cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()).into(),
         )
         .unwrap();
         let mut server_config = server_config;

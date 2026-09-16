@@ -1,3 +1,5 @@
+#![cfg(feature = "cli")]
+
 use std::{
     collections::{BTreeMap, HashMap},
     ffi::OsString,
@@ -22,7 +24,7 @@ use easytier_core::connectivity::stun::StunInfoProvider as _;
 use humansize::format_size;
 use rust_i18n::t;
 use service_manager::*;
-use tabled::settings::{Disable, Modify, Style, Width, location::ByColumnName, object::Columns};
+use tabled::settings::{Modify, Remove, Style, Width, location::ByColumnName, object::Columns};
 use terminal_size::{Width as TerminalWidth, terminal_size};
 use unicode_width::UnicodeWidthStr;
 
@@ -533,9 +535,10 @@ struct InstallArgs {
     service_work_dir: Option<PathBuf>,
 
     #[arg(
-        trailing_var_arg = true,
+        long,
+        num_args = 1..,
         allow_hyphen_values = true,
-        help = "args to pass to easytier-core"
+        help = "args to pass to easytier-core, must be the last option of install"
     )]
     core_args: Option<Vec<OsString>>,
 }
@@ -698,6 +701,69 @@ mod tests {
         assert!(active[proxy_index]);
         assert!(!dropped.contains(&proxy_index));
         assert!(total_width <= 79);
+    }
+
+    fn parse_install_core_args(argv: &[&str]) -> Vec<OsString> {
+        let cli = Cli::try_parse_from(argv).expect("failed to parse cli");
+        let SubCommand::Service(service_args) = cli.sub_command else {
+            panic!("not a service subcommand");
+        };
+        let ServiceSubCommand::Install(install_args) = service_args.sub_command else {
+            panic!("not an install subcommand");
+        };
+        install_args.core_args.expect("no core args")
+    }
+
+    #[test]
+    fn install_core_args_do_not_include_the_flag_itself() {
+        // trailing_var_arg used to collect the "--core-args" token itself into
+        // the value, breaking the installed service's command line.
+        let args = parse_install_core_args(&[
+            "easytier-cli",
+            "service",
+            "install",
+            "--core-args",
+            "--daemon",
+            "--config-dir",
+            "/nonexistent",
+        ]);
+        assert_eq!(args, vec!["--daemon", "--config-dir", "/nonexistent"]);
+    }
+
+    #[test]
+    fn install_core_args_support_equals_form() {
+        let args = parse_install_core_args(&[
+            "easytier-cli",
+            "service",
+            "install",
+            "--core-args=--daemon",
+        ]);
+        assert_eq!(args, vec!["--daemon"]);
+    }
+
+    #[test]
+    fn install_options_before_core_args_still_parse() {
+        let cli = Cli::try_parse_from([
+            "easytier-cli",
+            "service",
+            "install",
+            "--disable-autostart",
+            "true",
+            "--core-args",
+            "--daemon",
+        ])
+        .expect("failed to parse cli");
+        let SubCommand::Service(service_args) = cli.sub_command else {
+            panic!("not a service subcommand");
+        };
+        let ServiceSubCommand::Install(install_args) = service_args.sub_command else {
+            panic!("not an install subcommand");
+        };
+        assert_eq!(install_args.disable_autostart, Some(true));
+        assert_eq!(
+            install_args.core_args.expect("no core args"),
+            vec!["--daemon"]
+        );
     }
 }
 
@@ -1845,7 +1911,7 @@ impl<'a> CommandHandler<'a> {
         struct RouteTableItem {
             ipv4: String,
             hostname: String,
-            #[tabled(display_with = "format_proxy_cidrs")]
+            #[tabled(display("format_proxy_cidrs"))]
             proxy_cidrs: String,
 
             next_hop_ipv4: String,
@@ -3127,7 +3193,7 @@ fn apply_column_drops(table: &mut tabled::Table, drop_indices: &[usize]) {
     let mut indices = drop_indices.to_vec();
     indices.sort_unstable_by(|a, b| b.cmp(a));
     for index in indices {
-        table.with(Disable::column(Columns::single(index)));
+        table.with(Remove::column(Columns::one(index)));
     }
 }
 
